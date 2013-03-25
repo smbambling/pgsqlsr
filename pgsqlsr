@@ -1,0 +1,379 @@
+#!/bin/bash
+
+#
+#   Resource Agent for managing Postgresql Streaming Replication.
+#
+#   License:      PostgreSQL License (BSD Like)
+#   (c) 2013-2014 Steven Bambling
+#
+
+# export OCF_ROOT=/usr/lib/ocf for testing within the shell
+
+# Initialization
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Default parameters
+OCF_RESKEY_system_user_default=postgres
+OCF_RESKEY_pgdb_default=template1
+OCF_RESKEY_bindir_default=/usr/pgsql-9.2/bin
+OCF_RESKEY_pgdata_default=/var/lib/pgsql/9.2/data
+OCF_RESKEY_psql_default=/usr/bin/psql
+OCF_RESKEY_monitor_sql_default="select now();"
+
+: ${OCF_RESKEY_system_user=${OCF_RESKEY_system_user_default}}
+: ${OCF_RESKEY_pgdb=${OCF_RESKEY_pgdb_default}}
+: ${OCF_RESKEY_bindir=${OCF_RESKEY_bindir_default}}
+: ${OCF_RESKEY_pgdata=${OCF_RESKEY_pgdata_default}}
+: ${OCF_RESKEY_psql=${OCF_RESKEY_psql_default}}
+: ${OCF_RESKEY_monitor_sql=${OCF_RESKEY_monitor_sql_default}}
+
+
+
+ocf_meta_data() {
+    cat <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="pgsqlsr">
+    <version>1.0</version>
+
+    <longdesc lang="en">
+        Resource script for PostgreSQL in replication. It manages PostgreSQL servers using streaming replication as an HA resource.
+    </longdesc>
+    <shortdesc lang="en">Manages PostgreSQL servers in replication</shortdesc>
+  
+    <parameters>
+
+        <parameter name="system_user" unique="0" required="0">
+            <longdesc lang="en">
+                System user account used to run the PostgreSQL server
+            </longdesc>
+            <shortdesc lang="en">PostgreSQL system User</shortdesc>
+            <content type="string" default="${OCF_RESKEY_system_user_default}" />
+        </parameter>
+	
+        <parameter name="pgdb" unique="0" required="0">
+            <longdesc lang="en">
+                Database that will be used for monitoring.
+	        </longdesc>
+            <shortdesc lang="en">pgdb</shortdesc>
+            <content type="string" default="${OCF_RESKEY_pgdb_default}" />
+        </parameter>
+
+        <parameter name="bindir" unique="0" required="0">
+            <longdesc lang="en">
+                Path to the directory storing the PostgreSQL binaries. The agent uses pg_controldata and pg_ctl.
+            </longdesc>
+            <shortdesc lang="en">Path to the PostgreSQL binaries</shortdesc>
+            <content type="string" default="${OCF_RESKEY_bindir_default}" />
+        </parameter>
+
+        <parameter name="pgdata" unique="0" required="0">
+            <longdesc lang="en">
+                Path to the data directory, e.g. PGDATA
+            </longdesc>
+            <shortdesc lang="en">Path to the data directory</shortdesc>
+            <content type="string" default="${OCF_RESKEY_pgdata_default}" />
+        </parameter>
+
+        <parameter name="psql" unique="0" required="0">
+            <longdesc lang="en">
+                Path to psql command.
+            </longdesc>
+            <shortdesc lang="en">psql</shortdesc>
+            <content type="string" default="${OCF_RESKEY_psql_default}" />
+        </parameter>    
+    
+        <parameter name="monitor_sql" unique="0" required="0">
+            <longdesc lang="en">
+                SQL script that will be used for monitor operations.
+            </longdesc>
+            <shortdesc lang="en">monitor_sql</shortdesc>
+            <content type="string" default="${OCF_RESKEY_monitor_sql_default}" />
+        </parameter>
+
+    </parameters>
+    <actions>
+        <action name="start" timeout="120" />
+        <action name="stop" timeout="120" />
+        <action name="monitor" depth="0" timeout="30" interval="10"/>
+        action name="monitor" role="Master" depth="0" timeout="30" interval="10" />
+        <action name="monitor" role="Slave" depth="0" timeout="30" interval="5" />
+        <action name="meta-data" timeout="5" />
+        <action name="validate-all" timeout="5" />
+        <action name="methods" timeout="5" />
+    </actions>
+</resource-agent>
+EOF
+}
+
+ocf_methods() {
+    cat <<EOF
+        start
+        stop
+        monitor
+        methods
+        meta-data
+        validate-all
+EOF
+}
+
+escape_string() {
+    echo "$*" | sed -e "s/'/'\\\\''/g"
+}
+
+# Check if node is the master or slave
+pg_state() {
+    # Check if running as master
+    su ${OCF_RESKEY_system_user} -c "${OCF_RESKEY_bindir}/pg_controldata ${OCF_RESKEY_pgdata} | grep -Eq '^Database cluster state: +in production'"
+    rc=$?
+    if [ $rc -eq 0 ]; then
+        ocf_log info "Postgresql currently running as MASTER"
+        return $OCF_RUNNING_MASTER
+    else
+        # Check if running as replica
+        su ${OCF_RESKEY_system_user} -c "${OCF_RESKEY_bindir}/pg_controldata ${OCF_RESKEY_pgdata} | grep -Eq '^Database cluster state: +in archive recovery'"
+        rc=$?
+        if [ $rc -eq 0 ]; then
+            ocf_log info "Postgresql currently running as Replica"
+            return $OCF_SUCCESS
+        else
+            ocf_log err "Can't determine the Postgresql state (Master/Replica)"
+            return return $OCF_ERR_GENERIC
+        fi
+    fi
+
+}
+
+pg_replica_status() {
+    # Check if node is a replica
+    pg_monitor
+    rc=$?
+    
+    if [ ${rc} = $OCF_SUCCESS ]; then
+        # Check the xlog_location_numeric position
+        su ${OCF_RESKEY_system_user} -c "${OCF_RESKEY_psql} -h ${node} -c 'select xlog_location_numeric()'"
+    fi
+}
+
+
+
+# Start the PostgreSQL server
+pg_start() {
+    local rc
+
+    pg_monitor
+	rc=$?
+
+	case $rc in
+        $OCF_SUCCESS)
+            ocf_log info "Postgresql service already started"
+            exit $OCF_SUCCESS
+            ;;
+       $OCF_NOT_RUNNING)
+            # Remove postmaster.pid if it exists
+            if [ -f $PIDFILE ]; then
+                ocf_log info "Removing $PIDFILE."
+                rm -f $PIDFILE
+            fi            
+
+            # Remove backup_label if it exists
+            if [ -f $BACKUPLABEL ]; then
+	            ocf_log info "Removing $BACKUPLABEL. The previous backup might have failed."
+	            rm -f $BACKUPLABEL
+            fi              
+    
+            ocf_log info "Starting Postgresql service"
+            su ${OCF_RESKEY_system_user} -c "${OCF_RESKEY_bindir}/pg_ctl -D ${OCF_RESKEY_pgdata} -w start"
+            rc=$?
+
+            if test $rc -eq 0; then
+                ocf_log info "Successfully started Postgresql service"
+                return $OCF_SUCCESS
+            else
+                ocf_log err "Can't start Postgresql service"
+                return $OCF_ERR_GENERIC
+            fi
+            ;;
+        $OCF_ERR_GENERIC)
+	        ocf_log error "Undefined status of Postgresql service"
+		    exit $OCF_ERR_GENERIC
+		    ;;
+    esac
+}
+
+# Stop the PostgreSQL server
+pg_stop() {
+    local rc
+
+    pg_monitor
+    rc=$?
+    
+    case $rc in
+        $OCF_SUCCESS|$OCF_RUNNING_MASTER)
+            ocf_log info "Stopping Postgresql service"
+            su ${OCF_RESKEY_system_user} -c "${OCF_RESKEY_bindir}/pg_ctl -D ${OCF_RESKEY_pgdata} stop -m fast"
+            rc=$?
+            
+            if test $rc -eq 0; then
+                ocf_log info "Successfully stopped Postgresql service"
+	            return $OCF_SUCCESS
+            else
+                ocf_log err "Can't stop Postgresql service"
+                return $OCF_ERR_GENERIC
+            fi
+            ;;
+        $OCF_NOT_RUNNING)
+            ocf_log info "Postgresql service already stopped"
+            return $OCF_SUCCESS
+            ;;
+        $OCF_ERR_GENERIC)
+            ocf_log error "Undefined status of Postgresql service"
+		    exit $OCF_ERR_GENERIC
+            ;;
+    esac
+}
+
+pg_monitor() {
+    local rc
+
+    su -l -c "${OCF_RESKEY_bindir}/pg_ctl -D ${OCF_RESKEY_pgdata} status 2>/dev/null|grep -q 'server is running'" ${OCF_RESKEY_system_user}
+    rc=$?
+
+    # Check if Postgresql service is running.
+    if [ $rc -eq 0 ]; then
+        ocf_log info "Postgresql service is running"
+        
+        # Check to see if we can connect to the database.
+        OCF_RESKEY_monitor_sql=$(escape_string "$OCF_RESKEY_monitor_sql")
+        su ${OCF_RESKEY_system_user} -c "${OCF_RESKEY_psql} -c '$OCF_RESKEY_monitor_sql' > /dev/null 2>&1"
+        rc=$?
+
+        if [ $rc -ne  0 ]; then
+            ocf_log $loglevel "Error connecting to $OCF_RESKEY_pgdb database"
+            
+            if [ $rc -eq 1 ]; then
+                ocf_log err "Fatal error (out of memory, file not found, etc.) occurred while executing the psql command."
+            elif [ $rc -eq 2 ]; then
+                ocf_log $loglevel "Connection error (connection to the server went bad and the session was not interactive) occurred while executing the psql command."
+            elif [ $rc -eq 3 ]; then
+                ocf_log err "Script error (the variable ON_ERROR_STOP was set) occurred while executing the psql command."
+            fi
+	        return $OCF_ERR_GENERIC
+        elif [ $rc -eq 0 ]; then
+            ocf_log info  "Successfull connected to $OCF_RESKEY_pgdb database"
+            pg_state
+        fi   
+    elif [ $rc -eq 1 ]; then
+        ocf_log info "Postgresql service in not running"
+	    return $OCF_NOT_RUNNING
+    else
+        ocf_log error "Undefined status of Postgresql service"
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+pg_promote() {
+    local rc
+    TIMELINEID=$(su -l -c "${OCF_RESKEY_bindir}/pg_controldata /var/lib/pgsql/9.2/data/ | grep 'TimeLineID' | cut -d' ' -f 10")
+    pg_monitor
+    rc=$?
+    
+    case "$rc" in
+        "$OCF_SUCCESS")
+            # Running as replica Normal, expected behavior.
+            ocf_log info "Postgresql currently running as Replica"
+            ocf_log info "Promoting from Replica to Master"
+
+            # Get current Postgresql TimeLine
+            ocf_log info "Current Postgresql TimeLine: ${TIMELINEID}"
+
+            # Move the recovery.conf to recovery.done
+            if [ -f ${OCF_RESKEY_pgdata}/recovery.conf ]; then
+                mv ${OCF_RESKEY_pgdata}/recovery.conf ${OCF_RESKEY_pgdata}/recovery.done
+            else
+                ocf_log info "No ${OCF_RESKEY_pgdata}/recovery.conf file present"
+            fi
+            
+            # Restart Postgresql service to maintain current timeline
+            ocf_log info "Restarting Postgresql service"
+            su ${OCF_RESKEY_system_user} -c "${OCF_RESKEY_bindir}/pg_ctl -D ${OCF_RESKEY_pgdata} restart"
+
+            # Check to see if Postgresql service is running and is in Master "mode"
+            pg_monitor
+            rc=$?
+ 
+            # Check to see that the new master is on the same timeline
+            if [ $rc = $OCF_RUNNING_MASTER ]; then
+                NEWTIMELINEID=$(su -l -c "${OCF_RESKEY_bindir}/pg_controldata /var/lib/pgsql/9.2/data/ | grep 'TimeLineID' | cut -d' ' -f 10"`)
+                if [ ${TIMELINEID} != ${NEWTIMELINEID} ]; then
+                    ocf_log err "The Postgresql service is on a new timeline ${NEWTIMELINEID}"
+                    return $OCF_ERR_GENERIC
+                else
+                    ocf_log info "Postgresql service started on the same timeline ${NEWTIMELINEID}"
+                    return $OCF_SUCCESS
+                fi
+            else
+                ocf_log err "Failed to promote to Master"
+                return $OCF_ERR_GENERIC
+            fi
+            ;;
+        "$OCF_RUNNING_MASTER")
+            # Already a master            
+            ocf_log info "Resource is already running as Master"
+            ocf_log info "Current TimelineID: ${TIMELINEID}"
+            return $OCF_SUCCESS
+            ;;
+        "$OCF_NOT_RUNNING")
+            # Currently not running. Need to start before promoting.
+            ocf_log info "Postgresql service is not running"
+            pg_start
+            ;;
+        *)
+            # Failed resource. Let the cluster manager recover.
+            ocf_log err "Unexpected error, cannot promote"
+            exit $rc
+            ;;
+    esac
+}
+    
+PIDFILE=${OCF_RESKEY_pgdata}/postmaster.pid
+BACKUPLABEL=${OCF_RESKEY_pgdata}/backup_label
+
+# Actions
+#start	 Start the resource	 Return 0 on success and an appropriate error code otherwise. Must not report success until the resource is fully active.
+#stop	 Stop the resource	 Return 0 on success and an appropriate error code otherwise. Must not report success until the resource is fully stopped.
+#monitor	 Check the resource's state	 Exit 0 if the resource is running, 7 if it is stopped and anything else if it is failed.
+#NOTE: The monitor script should test the state of the resource on the local machine only.
+#meta-data	 Describe the resource	 Provide information about this resource as an XML snippet. Exit with 0.
+#NOTE: This is not performed as root.
+#validate-all	 Verify the supplied parameters are correct	 Exit with 0 if parameters are valid, 2 if not valid, 6 if resource is not configured.
+
+case "$1" in
+    start)
+        pg_start
+        exit $?
+        ;;
+    stop)
+        pg_stop
+        exit $?
+        ;;
+    monitor|status)
+        pg_monitor
+        exit $?
+        ;;
+    promote)
+        pg_promote
+        exit $?
+        ;;
+    methods)
+        ocf_methods
+        exit 0
+        ;;
+    meta-data)
+        ocf_meta_data
+        exit 0
+        ;;
+    validate-all)
+        ;;
+esac
